@@ -34,9 +34,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"os"
 	"sync"
-	"math/rand"
 	"time"
 
 	"github.com/cmu440/rpc"
@@ -52,34 +52,32 @@ const kLogToStdout = true
 // Change this to output logs to a different directory
 const kLogOutputDir = "./raftlogs/"
 
-//
 // ApplyCommand
 // ========
 //
 // As each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyCommand to the service (or
 // tester) on the same server, via the applyCh passed to NewPeer()
-//
 type ApplyCommand struct {
 	Index   int
 	Command interface{}
 }
 
-//
 // Raft struct
 // ===========
 //
 // A Go object implementing a single Raft peer
-//
 const (
-    follower  = 0
-    candidate = 1
-    leader    = 2
+	follower  = 0
+	candidate = 1
+	leader    = 2
 )
 
+const heartbeatInterval = 120 * time.Millisecond
+
 type LogEntry struct {
-    Term    int
-    Command interface{}
+	Term    int
+	Command interface{}
 }
 
 type Raft struct {
@@ -101,32 +99,29 @@ type Raft struct {
 	electionDeadline time.Time
 
 	stopped bool
+	log     []LogEntry
 
-
-	log []LogEntry
-
+	heartbeatDeadline time.Time
 }
 
 func (rf *Raft) resetElectionDeadlineLocked() {
-    // Choose a fresh random delay.
-    // Set electionDeadline to now plus that delay.
+	// Choose a fresh random delay.
+	// Set electionDeadline to now plus that delay.
 
-	timeout := time.Duration(450 + rand.Intn(301)) * time.Millisecond
-	
+	timeout := time.Duration(450+rand.Intn(301)) * time.Millisecond
+
 	rf.electionDeadline = time.Now().Add(timeout)
 }
 
-
-
 // Caller must hold rf.mux.
 func (rf *Raft) startElectionLocked() {
-    // 1. Become a candidate.
+	// 1. Become a candidate.
 	rf.state = candidate
-    // 2. Increase the current term by one.
+	// 2. Increase the current term by one.
 	rf.currentTerm += 1
-    // 3. Vote for this peer itself.
+	// 3. Vote for this peer itself.
 	rf.votedFor = rf.me
-    // 4. Reset the election deadline.
+	// 4. Reset the election deadline.
 	rf.resetElectionDeadlineLocked()
 
 	term := rf.currentTerm
@@ -135,24 +130,22 @@ func (rf *Raft) startElectionLocked() {
 
 	lastIndex := len(rf.log) - 1
 
-
-	args := RequestVoteArgs {
-    Term:         term,
-    CandidateID:  rf.me,
-    LastLogIndex: lastIndex,
-    LastLogTerm:  rf.log[lastIndex].Term,
+	args := RequestVoteArgs{
+		Term:         term,
+		CandidateID:  rf.me,
+		LastLogIndex: lastIndex,
+		LastLogTerm:  rf.log[lastIndex].Term,
 	}
 
 	if votes >= majority {
-		rf.state = leader
+		rf.becomeLeaderLocked()
 		return
 	}
 
 	for peer := range rf.peers {
-		if peer == rf.me{
+		if peer == rf.me {
 			continue
 		}
-
 
 		go func(server int) {
 			var reply RequestVoteReply
@@ -181,7 +174,7 @@ func (rf *Raft) startElectionLocked() {
 				votes += 1
 			}
 			if majority <= votes {
-				rf.state = leader
+				rf.becomeLeaderLocked()
 			}
 			return
 
@@ -190,35 +183,84 @@ func (rf *Raft) startElectionLocked() {
 	}
 }
 
+// Caller must hold rf.mux.
+func (rf *Raft) becomeLeaderLocked() {
+	rf.state = leader
+	rf.broadcastHeartbeatLocked()
+}
+
+// Caller must hold rf.mux. RPC goroutines process replies under the same lock.
+func (rf *Raft) broadcastHeartbeatLocked() {
+	if rf.stopped || rf.state != leader {
+		return
+	}
+	term := rf.currentTerm
+	lastIndex := len(rf.log) - 1
+	args := AppendEntriesArgs{
+		Term:         term,
+		LeaderID:     rf.me,
+		PrevLogIndex: lastIndex,
+		PrevLogTerm:  rf.log[lastIndex].Term,
+		Entries:      nil,
+		LeaderCommit: 0, // Real commit tracking comes with log replication.
+	}
+	rf.heartbeatDeadline = time.Now().Add(heartbeatInterval)
+
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		go func(server int) {
+			var reply AppendEntriesReply
+			if !rf.sendAppendEntries(server, &args, &reply) {
+				return
+			}
+			rf.mux.Lock()
+			defer rf.mux.Unlock()
+			if rf.stopped {
+				return
+			}
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.state = follower
+				rf.votedFor = -1
+				return
+			}
+			if rf.state != leader || rf.currentTerm != term {
+				return
+			}
+			// Replication progress will be handled in a later step.
+		}(peer)
+	}
+}
 
 func (rf *Raft) electionLoop() {
-    for {
-        time.Sleep(10 * time.Millisecond)
+	for {
+		time.Sleep(10 * time.Millisecond)
 
-        rf.mux.Lock()
-        if rf.stopped {
-            rf.mux.Unlock()
-            return
-        }
+		rf.mux.Lock()
+		if rf.stopped {
+			rf.mux.Unlock()
+			return
+		}
 
-        // TODO: If this peer is not leader AND its deadline has passed,
-        // call the local election helper.
-		if rf.state != leader && time.Now().After(rf.electionDeadline) {
+		if rf.state == leader {
+			if time.Now().After(rf.heartbeatDeadline) {
+				rf.broadcastHeartbeatLocked()
+			}
+		} else if time.Now().After(rf.electionDeadline) {
 			rf.startElectionLocked()
 		}
 
-        rf.mux.Unlock()
-    }
+		rf.mux.Unlock()
+	}
 }
 
-
-//
 // GetState()
 // ==========
 //
 // Return "me", current term and whether this peer
 // believes it is the leader
-//
 func (rf *Raft) GetState() (int, int, bool) {
 	rf.mux.Lock()
 	var me int
@@ -232,26 +274,22 @@ func (rf *Raft) GetState() (int, int, bool) {
 	return me, term, isleader
 }
 
-//
 // RequestVoteArgs
 // ===============
 //
-// Example RequestVote RPC arguments structure
+// # Example RequestVote RPC arguments structure
 //
 // Please note
 // ===========
 // Field names must start with capital letters!
-//
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B)
-	Term int
-	CandidateID int
+	Term         int
+	CandidateID  int
 	LastLogIndex int
-	LastLogTerm int
-	
+	LastLogTerm  int
 }
 
-//
 // RequestVoteReply
 // ================
 //
@@ -260,20 +298,70 @@ type RequestVoteArgs struct {
 // Please note
 // ===========
 // Field names must start with capital letters!
-//
-//
 type RequestVoteReply struct {
 	// Your data here (3A)
-	Term int
+	Term        int
 	VoteGranted bool
 }
 
-//
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mux.Lock()
+	defer rf.mux.Unlock()
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	if rf.stopped {
+		return
+	}
+
+	if rf.currentTerm > args.Term {
+		return
+	}
+
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	rf.state = follower
+	reply.Term = rf.currentTerm
+	rf.resetElectionDeadlineLocked()
+
+	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.log) {
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return
+	}
+
+	if len(args.Entries) != 0 {
+		// TODO: Implement nonempty log replication later.
+		return
+	}
+
+	reply.Success = true
+
+}
+
 // RequestVote
 // ===========
 //
 // Example RequestVote RPC handler
-//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B)
 	rf.mux.Lock()
@@ -311,18 +399,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateID
 		reply.VoteGranted = true
 		rf.resetElectionDeadlineLocked()
-	} 
-
-
-
+	}
 
 }
 
-//
 // sendRequestVote
 // ===============
 //
-// Example code to send a RequestVote RPC to a server
+// # Example code to send a RequestVote RPC to a server
 //
 // server int -- index of the target server in
 // rf.peers[]
@@ -338,12 +422,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // The rpc package simulates a lossy network, in which servers
 // may be unreachable, and in which requests and replies may be lost
 //
-// Call() sends a request and waits for a reply
+// # Call() sends a request and waits for a reply
 //
 // If a reply arrives within a timeout interval, Call() returns true;
 // otherwise Call() returns false
 //
-// Thus Call() may not return for a while
+// # Thus Call() may not return for a while
 //
 // A false return can be caused by a dead server, a live server that
 // can't be reached, a lost request, or a lost reply
@@ -361,22 +445,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in the struct passed over RPC, and
 // that the caller passes the address of the reply struct with "&",
 // not the struct itself
-//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
-//
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
+}
+
 // PutCommand
 // =====
 //
 // The service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log
 //
-// If this server is not the leader, return false
+// # If this server is not the leader, return false
 //
-// Otherwise start the agreement and return immediately
+// # Otherwise start the agreement and return immediately
 //
 // There is no guarantee that this command will ever be committed to
 // the Raft log, since the leader may fail or lose an election
@@ -384,11 +470,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // The first return value is the index that the command will appear at
 // if it is ever committed
 //
-// The second return value is the current term
+// # The second return value is the current term
 //
 // The third return value is true if this server believes it is
 // the leader
-//
 func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -399,7 +484,6 @@ func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-//
 // Stop
 // ====
 //
@@ -409,7 +493,6 @@ func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 // You are not required to do anything
 // in Stop(), but it might be convenient to (for example)
 // turn off debug output from this instance
-//
 func (rf *Raft) Stop() {
 	// Your code here, if desired
 	rf.mux.Lock()
@@ -417,11 +500,10 @@ func (rf *Raft) Stop() {
 	rf.mux.Unlock()
 }
 
-//
 // NewPeer
 // ====
 //
-// The service or tester wants to create a Raft server
+// # The service or tester wants to create a Raft server
 //
 // The port numbers of all the Raft servers (including this one)
 // are in peers[]
@@ -438,7 +520,6 @@ func (rf *Raft) Stop() {
 //
 // NewPeer() must return quickly, so it should start Goroutines
 // for any long-running work
-//
 func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
@@ -473,7 +554,6 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 	rf.log = []LogEntry{{Term: 0}}
 
 	rf.resetElectionDeadlineLocked()
-
 
 	go rf.electionLoop()
 
