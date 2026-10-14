@@ -36,6 +36,8 @@ import (
 	"log"
 	"os"
 	"sync"
+	"math/rand"
+	"time"
 
 	"github.com/cmu440/rpc"
 )
@@ -69,6 +71,17 @@ type ApplyCommand struct {
 //
 // A Go object implementing a single Raft peer
 //
+const (
+    follower  = 0
+    candidate = 1
+    leader    = 2
+)
+
+type LogEntry struct {
+    Term    int
+    Command interface{}
+}
+
 type Raft struct {
 	mux   sync.Mutex       // Lock to protect shared access to this peer's state
 	peers []*rpc.ClientEnd // RPC end points of all peers
@@ -78,11 +91,126 @@ type Raft struct {
 	// you are free to remove it completely.
 	logger *log.Logger // We provide you with a separate logger per peer.
 
+	currentTerm int // Current election term.
+	votedFor    int // Peer voted for in this term; -1 means nobody.
+	state       int // follower, candidate, or leader.
+
 	// Your data here (3A, 3B).
 	// Look at the Raft paper's Figure 2 for a description of what
 	// state a Raft peer should maintain
+	electionDeadline time.Time
+
+	stopped bool
+
+
+	log []LogEntry
 
 }
+
+func (rf *Raft) resetElectionDeadlineLocked() {
+    // Choose a fresh random delay.
+    // Set electionDeadline to now plus that delay.
+
+	timeout := time.Duration(450 + rand.Intn(301)) * time.Millisecond
+	
+	rf.electionDeadline = time.Now().Add(timeout)
+}
+
+
+
+// Caller must hold rf.mux.
+func (rf *Raft) startElectionLocked() {
+    // 1. Become a candidate.
+	rf.state = candidate
+    // 2. Increase the current term by one.
+	rf.currentTerm += 1
+    // 3. Vote for this peer itself.
+	rf.votedFor = rf.me
+    // 4. Reset the election deadline.
+	rf.resetElectionDeadlineLocked()
+
+	term := rf.currentTerm
+	votes := 1
+	majority := len(rf.peers)/2 + 1
+
+	lastIndex := len(rf.log) - 1
+
+
+	args := RequestVoteArgs {
+    Term:         term,
+    CandidateID:  rf.me,
+    LastLogIndex: lastIndex,
+    LastLogTerm:  rf.log[lastIndex].Term,
+	}
+
+	if votes >= majority {
+		rf.state = leader
+		return
+	}
+
+	for peer := range rf.peers {
+		if peer == rf.me{
+			continue
+		}
+
+
+		go func(server int) {
+			var reply RequestVoteReply
+			ok := rf.sendRequestVote(server, &args, &reply)
+			if !ok {
+				return
+			}
+
+			rf.mux.Lock()
+			defer rf.mux.Unlock()
+			if rf.stopped {
+				return
+			}
+			if reply.Term > rf.currentTerm {
+				rf.state = follower
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				return
+			}
+
+			if rf.state != candidate || rf.currentTerm != term {
+				return
+			}
+
+			if reply.Term == term && reply.VoteGranted {
+				votes += 1
+			}
+			if majority <= votes {
+				rf.state = leader
+			}
+			return
+
+			// Process this reply in the order described below.
+		}(peer)
+	}
+}
+
+
+func (rf *Raft) electionLoop() {
+    for {
+        time.Sleep(10 * time.Millisecond)
+
+        rf.mux.Lock()
+        if rf.stopped {
+            rf.mux.Unlock()
+            return
+        }
+
+        // TODO: If this peer is not leader AND its deadline has passed,
+        // call the local election helper.
+		if rf.state != leader && time.Now().After(rf.electionDeadline) {
+			rf.startElectionLocked()
+		}
+
+        rf.mux.Unlock()
+    }
+}
+
 
 //
 // GetState()
@@ -92,10 +220,15 @@ type Raft struct {
 // believes it is the leader
 //
 func (rf *Raft) GetState() (int, int, bool) {
+	rf.mux.Lock()
 	var me int
 	var term int
 	var isleader bool
 	// Your code here (3A)
+	me = rf.me
+	term = rf.currentTerm
+	isleader = (rf.state == leader)
+	rf.mux.Unlock()
 	return me, term, isleader
 }
 
@@ -111,6 +244,11 @@ func (rf *Raft) GetState() (int, int, bool) {
 //
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B)
+	Term int
+	CandidateID int
+	LastLogIndex int
+	LastLogTerm int
+	
 }
 
 //
@@ -126,6 +264,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (3A)
+	Term int
+	VoteGranted bool
 }
 
 //
@@ -136,6 +276,46 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B)
+	rf.mux.Lock()
+	defer rf.mux.Unlock()
+
+	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = follower
+		rf.votedFor = -1
+
+	}
+
+	lastIndex := len(rf.log) - 1
+	lastTerm := rf.log[lastIndex].Term
+
+	var upToDate bool
+
+	if lastTerm < args.LastLogTerm {
+		upToDate = true
+	} else if args.LastLogTerm == lastTerm && lastIndex <= args.LastLogIndex {
+		upToDate = true
+	}
+
+	reply.Term = rf.currentTerm
+	canVote := (rf.votedFor == -1) || (rf.votedFor == args.CandidateID)
+
+	if canVote && upToDate {
+		rf.votedFor = args.CandidateID
+		reply.VoteGranted = true
+		rf.resetElectionDeadlineLocked()
+	} 
+
+
+
+
 }
 
 //
@@ -232,6 +412,9 @@ func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Stop() {
 	// Your code here, if desired
+	rf.mux.Lock()
+	rf.stopped = true
+	rf.mux.Unlock()
 }
 
 //
@@ -283,6 +466,16 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 	}
 
 	// Your initialization code here (3A, 3B)
+
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.state = follower
+	rf.log = []LogEntry{{Term: 0}}
+
+	rf.resetElectionDeadlineLocked()
+
+
+	go rf.electionLoop()
 
 	return rf
 }
